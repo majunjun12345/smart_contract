@@ -4,6 +4,7 @@ pragma solidity ^0.4.23;
 //
 // * Ethereum smart contract, deployed at 0xD1CEeeefA68a6aF0A5f6046132D986066c7f9426.
 //
+// 使用双重保障，防止被玩家、房主和矿工篡改，除了完全透明以外，还允许任意高的赌注
 // * Uses hybrid commit-reveal + block hash random number generation that is immune
 //   to tampering by players, house and miners. Apart from being fully transparent,
 //   this also allows arbitrarily high bets.
@@ -13,24 +14,40 @@ pragma solidity ^0.4.23;
 contract Dice2Win {
     /// *** Constants section
 
+    /*
+        每次赌注都会向房间缴纳 1% 的手续费，但是有个最小值，为 0.0003 以太币
+        最小金额由赌注交易所花费的 gas 决定，最高 10G wei
+    */
+
     // Each bet is deducted 1% in favour of the house, but no less than some minimum.
     // The lower bound is dictated by gas costs of the settleBet transaction, providing
     // headroom for up to 10 Gwei prices.
     uint constant HOUSE_EDGE_PERCENT = 1;
     uint constant HOUSE_EDGE_MINIMUM_AMOUNT = 0.0003 ether;
 
+    // 低于此金额的投注不能参与头奖，也不会扣除头奖费(0.001)
     // Bets lower than this amount do not participate in jackpot rolls (and are
     // not deducted JACKPOT_FEE).
     uint constant MIN_JACKPOT_BET = 0.1 ether;
 
+    // 赢得头奖的概率(1%)和向头奖池缴纳的费用
     // Chance to win jackpot (currently 0.1%) and fee deducted into jackpot fund.
     uint constant JACKPOT_MODULO = 1000;
     uint constant JACKPOT_FEE = 0.001 ether;
 
+    // 最小赌注和最大赌注
     // There is minimum and maximum bets.
     uint constant MIN_BET = 0.01 ether;
     uint constant MAX_AMOUNT = 300000 ether;
 
+    /* 
+    Modulo 是在任何游戏中出现的等概率的数字
+    2 抛硬币
+    6 掷骰子
+    36 掷两次骰子
+
+    37 轮盘赌
+    */
     // Modulo is a number of equiprobable outcomes in a game:
     //  - 2 for coin flip
     //  - 6 for dice
@@ -42,21 +59,36 @@ contract Dice2Win {
     // the remainder of its division by modulo is considered bet outcome.
     uint constant MAX_MODULO = 100;
 
+    /*  
+        threshold: 阙值
+        bit mask: 位掩码
+        endian: 字节序
+        modulo 6, 101000 表示押注 4 和 6
+    */
+
     // For modulos below this threshold rolls are checked against a bit mask,
     // thus allowing betting on any combination of outcomes. For example, given
     // modulo 6 for dice, 101000 mask (base-2, big endian) means betting on
     // 4 and 6; for games with modulos higher than threshold (Etheroll), a simple
     // limit is used, allowing betting on any outcome in [0, N) range.
-    //
+    /*
+        该数字是由 256 位的中间乘法决定的
+        实现更有效率的计数
+        40 是 42 以下 8 的最大倍数
+    */
     // The specific value is dictated by the fact that 256-bit intermediate
     // multiplication result allows implementing population count efficiently
     // for numbers that are up to 42 bits, and 40 is the highest multiple of
     // eight below 42.
     uint constant MAX_MASK_MODULO = 40;
 
+    // 这是为了检车赌注的 位溢出
     // This is a check on bet mask overflow.
     uint constant MAX_BET_MASK = 2 ** MAX_MASK_MODULO;
 
+    /*
+        EVM 区块hash 操作码 不能够查询超过以往的 256 块
+    */
     // EVM BLOCKHASH opcode can query no further than 256 blocks into the
     // past. Given that settleBet uses block hash of placeBet as one of
     // complementary entropy sources, we cannot process bets older than this
@@ -65,29 +97,48 @@ contract Dice2Win {
     // congestion; such bets can be refunded via invoking refundBet.
     uint constant BET_EXPIRATION_BLOCKS = 250;
 
+
+    /*
+        一些无效的地址用来初始化 秘密签名
+        强制维护人员在处理任何赌注前调用 setSecretSinger
+    */
     // Some deliberately invalid address to initialize the secret signer with.
     // Forces maintainers to invoke setSecretSigner before processing any bets.
     address constant DUMMY_ADDRESS = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
 
+    // 标准的合约所有者转移
     // Standard contract ownership transfer.
     address public owner;
     address private nextOwner;
 
+    // 调整最大赌率，用来限制动态赔率的赌注
     // Adjustable max bet profit. Used to cap bets against dynamic odds.
     uint public maxProfit;
 
+    // 私钥对应的地址，私钥用来给提交的 placeBet 签名
     // The address corresponding to a private key used to sign placeBet commits.
     address public secretSigner;
 
+    // 头奖奖池积累的奖金
     // Accumulated jackpot fund.
     uint128 public jackpotSize;
 
+    // 被锁住的有可能赢得赌注的赌金，用来防止合约没有充足资金支付
     // Funds that are locked in potentially winning bets. Prevents contract from
     // committing to bets it cannot pay out.
     uint128 public lockedInBets;
 
+    // 单个赌注的结构
     // A structure representing a single bet.
     struct Bet {
+        /*
+            赌金
+            游戏对应的 modulo
+            赌赢的数量，用来计算应得的奖金
+
+            位掩码，代表赢得赌局的数量
+            赌徒的地址，用来支付赌赢的奖金
+        */
         // Wager amount in wei.
         uint amount;
         // Modulo of a game.
@@ -103,9 +154,11 @@ contract Dice2Win {
         address gambler;
     }
 
+    // 
     // Mapping from commits to all currently active & processed bets.
     mapping (uint => Bet) bets;
 
+    // 事件 用来使统计更容易
     // Events that are issued to make statistic recovery easier.
     event FailedPayment(address indexed beneficiary, uint amount);
     event Payment(address indexed beneficiary, uint amount);
@@ -123,6 +176,7 @@ contract Dice2Win {
         _;
     }
 
+    // 所有权转移
     // Standard contract ownership transfer implementation,
     function approveNextOwner(address _nextOwner) external onlyOwner {
         require (_nextOwner != owner, "Cannot approve current owner.");
