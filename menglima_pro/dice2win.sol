@@ -1,5 +1,8 @@
 pragma solidity ^0.4.23;
 
+// placeBet 放注
+// settlebet 清算
+
 // * dice2.win - fair games that pay Ether.
 //
 // * Ethereum smart contract, deployed at 0xD1CEeeefA68a6aF0A5f6046132D986066c7f9426.
@@ -41,11 +44,11 @@ contract Dice2Win {
     uint constant MAX_AMOUNT = 300000 ether;
 
     /* 
-    Modulo 是在任何游戏中出现的等概率的数字
+    Modulo 是在任何游戏中出现的等概率的数字(可能就是指概率)
     2 抛硬币
     6 掷骰子
     36 掷两次骰子
-
+    100 以太过山车
     37 轮盘赌
     */
     // Modulo is a number of equiprobable outcomes in a game:
@@ -55,6 +58,9 @@ contract Dice2Win {
     //  - 100 for etheroll
     //  - 37 for roulette
     //  etc.
+    /*
+        之所以这么称呼是因为256位熵被视为一个巨大的整数，其除以模数的余数被视为下注结果。
+    */
     // It's called so because 256-bit entropy is treated like a huge integer and
     // the remainder of its division by modulo is considered bet outcome.
     uint constant MAX_MODULO = 100;
@@ -64,6 +70,10 @@ contract Dice2Win {
         bit mask: 位掩码
         endian: 字节序
         modulo 6, 101000 表示押注 4 和 6
+    
+        低于此阙值的 modulos, 将会和位掩码进行对照检查，从而允许投注任何的组合结果。
+        例如，给定 modulo 为 6 的骰子，掩码为 101000（base-2，big endian）意味着投注 4 和 6 
+        如果 modulo 高于阙值(etheroll 为最高 100)，将会有一个小小的限制，从而允许能够对任意范围的结果下注
     */
 
     // For modulos below this threshold rolls are checked against a bit mask,
@@ -72,8 +82,8 @@ contract Dice2Win {
     // 4 and 6; for games with modulos higher than threshold (Etheroll), a simple
     // limit is used, allowing betting on any outcome in [0, N) range.
     /*
-        该数字是由 256 位的中间乘法决定的
-        实现更有效率的计数
+        具体值取决于 256 位的中间乘法
+        允许对高达42位的数字有效地实现种群计数
         40 是 42 以下 8 的最大倍数
     */
     // The specific value is dictated by the fact that 256-bit intermediate
@@ -82,12 +92,18 @@ contract Dice2Win {
     // eight below 42.
     uint constant MAX_MASK_MODULO = 40;
 
-    // 这是为了检车赌注的 位溢出
+    // 这是对投注掩码的溢出检查
     // This is a check on bet mask overflow.
     uint constant MAX_BET_MASK = 2 ** MAX_MASK_MODULO;
 
     /*
-        EVM 区块hash 操作码 不能够查询超过以往的 256 块
+        EVM 区块hash 操作码 可以检查过去不超过 256 个块。
+
+        鉴于settleBet使用placeBet的块hash作为互补熵源之一，我们不能处理高于此阙值的堵住
+
+        在极少数情况下，由于技术原因或以太仿拥塞，dice2win 的庄家机器人会调用 settleBet 失败。
+        此类投注可以通过调用 refundBet 进行退款
+
     */
     // EVM BLOCKHASH opcode can query no further than 256 blocks into the
     // past. Given that settleBet uses block hash of placeBet as one of
@@ -100,7 +116,7 @@ contract Dice2Win {
 
     /*
         一些无效的地址用来初始化 秘密签名
-        强制维护人员在处理任何赌注前调用 setSecretSinger
+        强制维护人员在处理任何下注之前调用 setSecretSinger
     */
     // Some deliberately invalid address to initialize the secret signer with.
     // Forces maintainers to invoke setSecretSigner before processing any bets.
@@ -111,7 +127,7 @@ contract Dice2Win {
     address public owner;
     address private nextOwner;
 
-    // 调整最大赌率，用来限制动态赔率的赌注
+    // 可调整的最大赌注利润。 用于限制动态赔率的投注。
     // Adjustable max bet profit. Used to cap bets against dynamic odds.
     uint public maxProfit;
 
@@ -123,7 +139,7 @@ contract Dice2Win {
     // Accumulated jackpot fund.
     uint128 public jackpotSize;
 
-    // 被锁住的有可能赢得赌注的赌金，用来防止合约没有充足资金支付
+    // 被锁定在潜在获胜赌注中的资金，用来防止合约没有充足资金支付
     // Funds that are locked in potentially winning bets. Prevents contract from
     // committing to bets it cannot pay out.
     uint128 public lockedInBets;
@@ -134,9 +150,9 @@ contract Dice2Win {
         /*
             赌金
             游戏对应的 modulo
-            赌赢的数量，用来计算应得的奖金
-
-            位掩码，代表赢得赌局的数量
+            获胜的数量，用来计算获奖金额
+            放注的区块号码
+            位掩码，代表赢得赌局结果
             赌徒的地址，用来支付赌赢的奖金
         */
         // Wager amount in wei.
@@ -176,7 +192,7 @@ contract Dice2Win {
         _;
     }
 
-    // 所有权转移
+    // 所有权转移策略
     // Standard contract ownership transfer implementation,
     function approveNextOwner(address _nextOwner) external onlyOwner {
         require (_nextOwner != owner, "Cannot approve current owner.");
@@ -188,6 +204,7 @@ contract Dice2Win {
         owner = nextOwner;
     }
 
+    // 备用函数，故意留空，主要用途是给账户充值
     // Fallback function deliberately left empty. It's primary use case
     // is to top up the bank roll.
     function () public payable {
@@ -198,12 +215,14 @@ contract Dice2Win {
         secretSigner = newSecretSigner;
     }
 
+    // 更改最大赌注奖励。 将此设置为零可有效禁用投注。
     // Change max bet reward. Setting this to zero effectively disables betting.
     function setMaxProfit(uint _maxProfit) public onlyOwner {
         require (_maxProfit < MAX_AMOUNT, "maxProfit should be a sane number.");
         maxProfit = _maxProfit;
     }
 
+    // 此函数用于提高头奖奖金。 只能增加不能减少
     // This function is used to bump up the jackpot fund. Cannot be used to lower it.
     function increaseJackpot(uint increaseAmount) external onlyOwner {
         require (increaseAmount <= address(this).balance, "Increase amount larger than balance.");
@@ -211,6 +230,7 @@ contract Dice2Win {
         jackpotSize += uint128(increaseAmount);
     }
 
+    // 支付 dice2.win 的操作费用
     // Funds withdrawal to cover costs of dice2.win operation.
     function withdrawFunds(address beneficiary, uint withdrawAmount) external onlyOwner {
         require (withdrawAmount <= address(this).balance, "Increase amount larger than balance.");
@@ -218,6 +238,7 @@ contract Dice2Win {
         sendFunds(beneficiary, withdrawAmount, withdrawAmount);
     }
 
+    // 只有在没有人进行投注时，无论是已结算还是已退款，合约才会被会被销毁。所有的金额都将被合约的所属者拥有
     // Contract may be destroyed only when there are no ongoing bets,
     // either settled or refunded. All funds are transferred to contract owner.
     function kill() external onlyOwner {
@@ -225,28 +246,41 @@ contract Dice2Win {
         selfdestruct(owner);
     }
 
+
+    // 投注逻辑
     /// *** Betting logic
 
     // Bet states:
-    //  amount == 0 && gambler == 0 - 'clean' (can place a bet)
-    //  amount != 0 && gambler != 0 - 'active' (can be settled or refunded)
-    //  amount == 0 && gambler != 0 - 'processed' (can clean storage)
+    //  amount == 0 && gambler == 0 - 'clean' (can place a bet)                可以下注
+    //  amount != 0 && gambler != 0 - 'active' (can be settled or refunded)    可以结算或退款
+    //  amount == 0 && gambler != 0 - 'processed' (can clean storage)          可清楚存储
 
-    // Bet placing transaction - issued by the player.
-    //  betMask         - bet outcomes bit mask for modulo <= MAX_MASK_MODULO,
+    // Bet placing transaction - issued by the player.                         投注交易 - 由玩家发起
+    //  betMask         - bet outcomes bit mask for modulo <= MAX_MASK_MODULO,  打赌结果的位掩码，小于最大的位掩码
     //                    [0, betMask) for larger modulos.
     //  modulo          - game modulo.
-    //  commitLastBlock - number of the maximum block where "commit" is still considered valid.
+    //  commitLastBlock - number of the maximum block where "commit" is still considered valid.   最大快数量，commit 状态依旧被认为是有效的
+    
+    /*
+        Keccak256哈希的一些秘密“揭示”随机数，由settleBet交易中的dice2.win croupier bot提供。
+        提供“提交”确保在开始放置placeBet后不能在幕后更改“显示”。
+    */
     //  commit          - Keccak256 hash of some secret "reveal" random number, to be supplied
     //                    by the dice2.win croupier bot in the settleBet transaction. Supplying
     //                    "commit" ensures that "reveal" cannot be changed behind the scenes
     //                    after placeBet have been mined.
-    //  r, s            - components of ECDSA signature of (commitLastBlock, commit). v is
-    //                    guaranteed to always equal 27.
+    //  r, s            - components of ECDSA signature of (commitLastBlock, commit). v is       ECDSA签名的组成部分
+    //                    guaranteed to always equal 27.                                         v 总是等于 27
     //
+
+    // Commit，基本上是随机的256位数，用作'bets'映射中的唯一投注标识符。
     // Commit, being essentially random 256-bit number, is used as a unique bet identifier in
     // the 'bets' mapping.
     //
+    /*
+        commits 和 block 绑定，以确保最多使用一次；否则，矿工将可能通过已知的 commit/reveal 进行下注，而且可能会更改 blockhash
+        croupier 会始终确保 commitLastBlock 不大于 placeBet block number 加上 BET_EXPIRATION_BLOCKS
+    */
     // Commits are signed with a block limit to ensure that they are used at most once - otherwise
     // it would be possible for a miner to place a bet with a known commit/reveal pair and tamper
     // with the blockhash. Croupier guarantees that commitLastBlock will always be not greater than
