@@ -2,6 +2,7 @@ pragma solidity ^0.4.23;
 
 // placeBet 放注
 // settlebet 清算
+// commit 随机的 256位 数字，用来唯一标识一次赌注
 
 // * dice2.win - fair games that pay Ether.
 //
@@ -18,7 +19,7 @@ contract Dice2Win {
     /// *** Constants section
 
     /*
-        每次赌注都会向房间缴纳 1% 的手续费，但是有个最小值，为 0.0003 以太币
+        每次赌注都会向庄家缴纳 1% 的手续费，但是有个最小值，为 0.0003 以太币
         最小金额由赌注交易所花费的 gas 决定，最高 10G wei
     */
 
@@ -33,7 +34,7 @@ contract Dice2Win {
     // not deducted JACKPOT_FEE).
     uint constant MIN_JACKPOT_BET = 0.1 ether;
 
-    // 赢得头奖的概率(1%)和向头奖池缴纳的费用
+    // 赢得头奖的概率(0.1%)和向头奖池缴纳的费用
     // Chance to win jackpot (currently 0.1%) and fee deducted into jackpot fund.
     uint constant JACKPOT_MODULO = 1000;
     uint constant JACKPOT_FEE = 0.001 ether;
@@ -50,6 +51,8 @@ contract Dice2Win {
     36 掷两次骰子
     100 以太过山车
     37 轮盘赌
+
+    选择哪种 modulo 就是选择哪种游戏
     */
     // Modulo is a number of equiprobable outcomes in a game:
     //  - 2 for coin flip
@@ -72,7 +75,7 @@ contract Dice2Win {
         modulo 6, 101000 表示押注 4 和 6
     
         低于此阙值的 modulos, 将会和位掩码进行对照检查，从而允许投注任何的组合结果。
-        例如，给定 modulo 为 6 的骰子，掩码为 101000（base-2，big endian）意味着投注 4 和 6 
+        例如，玩 modulo 为 6 的单个骰子游戏，掩码为 101000（base-2，big endian）意味着投注 4 和 6 
         如果 modulo 高于阙值(etheroll 为最高 100)，将会有一个小小的限制，从而允许能够对任意范围的结果下注
     */
 
@@ -83,7 +86,7 @@ contract Dice2Win {
     // limit is used, allowing betting on any outcome in [0, N) range.
     /*
         具体值取决于 256 位的中间乘法
-        允许对高达42位的数字有效地实现种群计数
+        允许对高达42位的数字有效地实现人口计数
         40 是 42 以下 8 的最大倍数
     */
     // The specific value is dictated by the fact that 256-bit intermediate
@@ -97,7 +100,7 @@ contract Dice2Win {
     uint constant MAX_BET_MASK = 2 ** MAX_MASK_MODULO;
 
     /*
-        EVM 区块hash 操作码 可以检查过去不超过 256 个块。
+        EVM 区块hash 操作码 可以查询过去不超过 256 个块。
 
         鉴于settleBet使用placeBet的块hash作为互补熵源之一，我们不能处理高于此阙值的堵住
 
@@ -116,7 +119,7 @@ contract Dice2Win {
 
     /*
         一些无效的地址用来初始化 秘密签名
-        强制维护人员在处理任何下注之前调用 setSecretSinger
+        强制维护人员在处理任何下注之前调用 setSecretSigner
     */
     // Some deliberately invalid address to initialize the secret signer with.
     // Forces maintainers to invoke setSecretSigner before processing any bets.
@@ -131,7 +134,7 @@ contract Dice2Win {
     // Adjustable max bet profit. Used to cap bets against dynamic odds.
     uint public maxProfit;
 
-    // 私钥对应的地址，私钥用来给提交的 placeBet 签名
+    // 私钥对应的地址，私钥用来给的 placeBet 的赌注提交签名
     // The address corresponding to a private key used to sign placeBet commits.
     address public secretSigner;
 
@@ -152,7 +155,7 @@ contract Dice2Win {
             游戏对应的 modulo
             获胜的数量，用来计算获奖金额
             放注的区块号码
-            位掩码，代表赢得赌局结果
+            掩码，代表赢得赌局结果
             赌徒的地址，用来支付赌赢的奖金
         */
         // Wager amount in wei.
@@ -170,7 +173,7 @@ contract Dice2Win {
         address gambler;
     }
 
-    // 
+    // 赌注提交 和 赌注状态的对应关系，commit 可能就是对应赌注的一个 id（随机的 256 位数）
     // Mapping from commits to all currently active & processed bets.
     mapping (uint => Bet) bets;
 
@@ -186,6 +189,7 @@ contract Dice2Win {
         secretSigner = DUMMY_ADDRESS;
     }
 
+    // 装饰器，限制条件，仅限于合约拥有者调用
     // Standard modifier on methods invokable only by contract owner.
     modifier onlyOwner {
         require (msg.sender == owner, "OnlyOwner methods called by non-owner.");
@@ -198,7 +202,6 @@ contract Dice2Win {
         require (_nextOwner != owner, "Cannot approve current owner.");
         nextOwner = _nextOwner;
     }
-
     function acceptNextOwner() external {
         require (msg.sender == nextOwner, "Can only accept preapproved new owner.");
         owner = nextOwner;
@@ -253,7 +256,7 @@ contract Dice2Win {
     // Bet states:
     //  amount == 0 && gambler == 0 - 'clean' (can place a bet)                可以下注
     //  amount != 0 && gambler != 0 - 'active' (can be settled or refunded)    可以结算或退款
-    //  amount == 0 && gambler != 0 - 'processed' (can clean storage)          可清楚存储
+    //  amount == 0 && gambler != 0 - 'processed' (can clean storage)          可能是该赌局已经完成，可清除存储的相关信息
 
     // Bet placing transaction - issued by the player.                         投注交易 - 由玩家发起
     //  betMask         - bet outcomes bit mask for modulo <= MAX_MASK_MODULO,  打赌结果的位掩码，小于最大的位掩码
@@ -263,7 +266,7 @@ contract Dice2Win {
     
     /*
         Keccak256哈希的一些秘密“揭示”随机数，由settleBet交易中的dice2.win croupier bot提供。
-        提供“提交”确保在开始放置placeBet后不能在幕后更改“显示”。
+        提供“提交”确保在开始放置placeBet后不能在幕后更改。
     */
     //  commit          - Keccak256 hash of some secret "reveal" random number, to be supplied
     //                    by the dice2.win croupier bot in the settleBet transaction. Supplying
@@ -344,6 +347,12 @@ contract Dice2Win {
         bet.gambler = msg.sender;
     }
 
+    /*
+        交易处理 - 理论上任何人都能够处理，但是在设计上只能被 dice2.win 庄家机器人处理。
+        为了处理具有特定 'commit' 的赌注，settleBet 接口应当提供一个 'reveal' 数字，这个数字应当和 'commit' 的 Keccak256 哈希值相等
+        clean_commit 是以前已经被处理过的赌注，将会被转换为 'clean' 状态，以防止区块链膨胀并退换一些 gas
+    */
+
     // Settlement transaction - can in theory be issued by anyone, but is designed to be
     // handled by the dice2.win croupier bot. To settle a bet with a specific "commit",
     // settleBet should supply a "reveal" number that would Keccak256-hash to
@@ -364,6 +373,7 @@ contract Dice2Win {
         // Check that bet is in 'active' state.
         require (amount != 0, "Bet should be in an 'active' state");
 
+        // 只能查阅最近 256 个区块的 hash 值
         // Check that bet has not expired yet (see comment to BET_EXPIRATION_BLOCKS).
         require (block.number > placeBlockNumber, "settleBet in the same block as placeBet, or before.");
         require (block.number <= placeBlockNumber + BET_EXPIRATION_BLOCKS, "Blockhash can't be queried by EVM.");
@@ -434,6 +444,13 @@ contract Dice2Win {
         clearProcessedBet(cleanCommit);
     }
 
+    /*
+        退款交易 - 由于时间到期，将返还未处理的赌金；
+        由于 EVM 的限制，还不能处理这样的区块。
+        如果您发现自己处于这样的情况，请联系 dice2.win 获得技术支持
+        但是没有什么可以阻止你调用这个方法
+    */
+
     // Refund transaction - return the bet amount of a roll that was not processed in a
     // due timeframe. Processing such blocks is not possible due to EVM limitations (see
     // BET_EXPIRATION_BLOCKS comment above for details). In case you ever find yourself
@@ -463,6 +480,7 @@ contract Dice2Win {
         sendFunds(bet.gambler, amount, amount);
     }
 
+    // 批量清除存储的辅助程序
     // A helper routine to bulk clean the storage.
     function clearStorage(uint[] cleanCommits) external {
         uint length = cleanCommits.length;
@@ -472,6 +490,7 @@ contract Dice2Win {
         }
     }
 
+    // 将 'processed' 的赌注状态变为 'clean' 状态
     // Helper routine to move 'processed' bets into 'clean' state.
     function clearProcessedBet(uint commit) private {
         Bet storage bet = bets[commit];
@@ -491,6 +510,7 @@ contract Dice2Win {
         bet.gambler = address(0);
     }
 
+    // 减去庄家优势后所赢得的赌金
     // Get the expected win amount after house edge is subtracted.
     function getDiceWinAmount(uint amount, uint modulo, uint rollUnder) private pure returns (uint winAmount, uint jackpotFee) {
         require (0 < rollUnder && rollUnder <= modulo, "Win probability out of range.");
@@ -507,6 +527,7 @@ contract Dice2Win {
         winAmount = (amount - houseEdge - jackpotFee) * modulo / rollUnder;
     }
 
+    // 处理付款的辅助程序
     // Helper routine to process the payment.
     function sendFunds(address beneficiary, uint amount, uint successLogAmount) private {
         if (beneficiary.send(amount)) {
@@ -516,6 +537,7 @@ contract Dice2Win {
         }
     }
 
+    // 请参阅白皮书了解其背后的含义
     // This are some constants making O(1) population count in placeBet possible.
     // See whitepaper for intuition and proofs behind it.
     uint constant POPCNT_MULT = 0x0000000000002000000000100000000008000000000400000000020000000001;
